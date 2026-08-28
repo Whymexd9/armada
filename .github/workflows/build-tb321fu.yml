@@ -37,6 +37,7 @@ jobs:
             --platform linux/arm64 \
             --pull=newer \
             --build-arg "ARMADA_VERSION=${version}" \
+            --build-arg "MESA_X86_PKG=ghcr.io/armada-os/armada-packages/mesa-x86:latest" \
             --tag localhost/armada:tb321fu \
             .
 
