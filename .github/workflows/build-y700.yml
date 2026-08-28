@@ -68,9 +68,6 @@ jobs:
           mkdir -p out work/rootfs work/kernel work/debs work/deb-root
           rootfs=out/armada-y700-rootfs.img
           truncate -s "$ROOTFS_SIZE" "$rootfs"
-          # Do not discard/zero the whole sparse image on the hosted runner.  Lazy
-          # inode/journal initialisation makes mkfs finish in seconds while the
-          # resulting filesystem is fully valid after first mount/e2fsck.
           sudo mkfs.ext4 -F -L Armada -E nodiscard,lazy_itable_init=1,lazy_journal_init=1 "$rootfs"
           sudo mount -o loop "$rootfs" work/rootfs
 
@@ -94,9 +91,8 @@ jobs:
           curl -fL --retry 3 -o work/kernel.tar.gz "$KERNEL_ARTIFACT_URL"
           tar -xzf work/kernel.tar.gz -C work/kernel
           echo '=== Y700 kernel artifact inventory ==='
-          find work/kernel -maxdepth 5 -type f -printf '%P\n' | sort | head -200
+          find work/kernel -maxdepth 5 -type f -printf '%P\n' | sort | sed -n '1,200p'
 
-          # Install module trees if the verified kernel input contains them.
           while IFS= read -r moddir; do
             kver=$(basename "$moddir")
             [ -n "$kver" ] || continue
@@ -114,7 +110,6 @@ jobs:
             dpkg-deb -x "$deb" work/deb-root
           done
 
-          # Transplant distro-neutral device payloads only; Ubuntu-linked userspace binaries stay out.
           copy_tree() {
             src=$1 dst=$2
             [ -e "work/deb-root/$src" ] || return 0
@@ -141,8 +136,6 @@ jobs:
           sudo truncate -s 0 work/rootfs/etc/machine-id
           sudo rm -f work/rootfs/var/lib/dbus/machine-id || true
           printf 'LABEL=Armada / ext4 defaults,noatime 0 1\n' | sudo tee work/rootfs/etc/fstab >/dev/null
-
-          # bootc update writes are intentionally disabled for this Android/GRUB partition layout.
           sudo systemctl --root=work/rootfs disable bootc-fetch-apply-updates.timer 2>/dev/null || true
 
           echo '=== Rootfs validation ==='
@@ -152,7 +145,7 @@ jobs:
           grep -q '^armada:' work/rootfs/etc/passwd
           test -d "work/rootfs/usr/lib/modules/$kver"
           test "$(find "work/rootfs/usr/lib/modules/$kver" -type f | wc -l)" -gt 0
-          find "work/rootfs/usr/lib/modules/$kver" -type f | head -50
+          find "work/rootfs/usr/lib/modules/$kver" -type f | sed -n '1,50p'
 
           sudo umount work/rootfs
           sudo e2fsck -fy "$rootfs" || rc=$?
