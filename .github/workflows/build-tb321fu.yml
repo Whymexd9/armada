@@ -1,0 +1,84 @@
+name: Build TB321FU Port
+
+on:
+  push:
+    branches:
+      - tb321fu
+    paths:
+      - 'Containerfile'
+      - 'build_files/**'
+      - 'system_files/usr/lib/armada/supported-dtbs'
+      - 'tb321fu/**'
+      - '.github/workflows/build-tb321fu.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y podman buildah jq
+
+      - name: Build TB321FU Armada container
+        run: |
+          set -euxo pipefail
+          version="tb321fu-$(date -u +%Y%m%d).${GITHUB_SHA::8}"
+          podman build \
+            --platform linux/arm64 \
+            --pull=newer \
+            --build-arg "ARMADA_VERSION=${version}" \
+            --build-arg "MESA_X86_PKG=ghcr.io/armada-os/armada-packages/mesa-x86:latest" \
+            --tag localhost/armada:tb321fu \
+            .
+
+      - name: Validate TB321FU payload in image
+        run: |
+          set -euxo pipefail
+          podman run --rm --entrypoint /bin/bash localhost/armada:tb321fu -lc '
+            test -f /usr/lib/armada/tb321fu-kernel
+            test -f /usr/lib/armada/tb321fu-dtb
+            kver=$(cat /usr/lib/armada/tb321fu-kernel)
+            dtb=$(cat /usr/lib/armada/tb321fu-dtb)
+            test "$kver" = "7.1.1-g5df8e852ea72"
+            test "$dtb" = "sm8650-lenovo-tb321fu.dtb"
+            test -f "/usr/lib/modules/$kver/vmlinuz"
+            test -f "/usr/lib/modules/$kver/dtb/qcom/$dtb"
+            test -L "/usr/lib/modules/$kver/dtb/platform.dtb"
+            test -f "/usr/lib/modules/$kver/initramfs.img"
+            grep -qx sm8650-lenovo-tb321fu /usr/lib/armada/supported-dtbs
+            test -e /usr/lib/firmware/qcom/gen70900_aqe.fw
+            test -e /usr/lib/firmware/qcom/gen70900_sqe.fw
+            test -e /usr/lib/firmware/qcom/gen70900_zap.mbn
+            test -e /usr/lib/firmware/qcom/gmu_gen70900.bin
+            test -e /usr/lib/firmware/qcom/sm8650/Lenovo-Y700-TB321FU-tplg.bin
+            test -e /usr/lib/firmware/qcom/vpu/vpu33_p4.mbn
+            bootc container lint
+            echo "TB321FU container validation passed"
+          '
+
+      - name: Save build metadata
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          podman inspect localhost/armada:tb321fu > out/container-inspect.json
+          podman run --rm --entrypoint /bin/bash localhost/armada:tb321fu -lc '
+            printf "kernel=%s\n" "$(cat /usr/lib/armada/tb321fu-kernel)"
+            printf "dtb=%s\n" "$(cat /usr/lib/armada/tb321fu-dtb)"
+            find /usr/lib/modules -maxdepth 3 -type f | sort | head -300
+          ' > out/tb321fu-build-info.txt
+
+      - name: Upload validation metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: tb321fu-container-validation
+          path: out/*
