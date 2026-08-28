@@ -5,6 +5,9 @@ source /ctx/tb321fu/port.env
 
 [ "${TB321FU_PORT:-0}" = 1 ] || exit 0
 
+# Device debs may use data.tar.zst. Keep extraction tooling explicit.
+dnf5 -y install --setopt=install_weak_deps=False zstd
+
 work=$(mktemp -d /tmp/tb321fu.XXXXXX)
 trap 'rm -rf "$work"' EXIT
 
