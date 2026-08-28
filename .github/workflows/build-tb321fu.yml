@@ -7,6 +7,7 @@ on:
     paths:
       - 'Containerfile'
       - 'build_files/**'
+      - 'system_files/usr/lib/armada/supported-dtbs'
       - 'tb321fu/**'
       - '.github/workflows/build-tb321fu.yml'
   workflow_dispatch:
@@ -50,8 +51,10 @@ jobs:
             test "$kver" = "7.1.1-g5df8e852ea72"
             test "$dtb" = "sm8650-lenovo-tb321fu.dtb"
             test -f "/usr/lib/modules/$kver/vmlinuz"
-            test -f "/usr/lib/modules/$kver/dtb/$dtb"
+            test -f "/usr/lib/modules/$kver/dtb/qcom/$dtb"
+            test -L "/usr/lib/modules/$kver/dtb/platform.dtb"
             test -f "/usr/lib/modules/$kver/initramfs.img"
+            grep -qx sm8650-lenovo-tb321fu /usr/lib/armada/supported-dtbs
             test -e /usr/lib/firmware/qcom/gen70900_aqe.fw
             test -e /usr/lib/firmware/qcom/gen70900_sqe.fw
             test -e /usr/lib/firmware/qcom/gen70900_zap.mbn
@@ -70,7 +73,7 @@ jobs:
           podman run --rm --entrypoint /bin/bash localhost/armada:tb321fu -lc '
             printf "kernel=%s\n" "$(cat /usr/lib/armada/tb321fu-kernel)"
             printf "dtb=%s\n" "$(cat /usr/lib/armada/tb321fu-dtb)"
-            find /usr/lib/modules -maxdepth 2 -type f | sort | head -200
+            find /usr/lib/modules -maxdepth 3 -type f | sort | head -300
           ' > out/tb321fu-build-info.txt
 
       - name: Upload validation metadata
