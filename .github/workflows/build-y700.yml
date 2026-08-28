@@ -68,7 +68,10 @@ jobs:
           mkdir -p out work/rootfs work/kernel work/debs work/deb-root
           rootfs=out/armada-y700-rootfs.img
           truncate -s "$ROOTFS_SIZE" "$rootfs"
-          sudo mkfs.ext4 -F -L Armada -E lazy_itable_init=0,lazy_journal_init=0 "$rootfs"
+          # Do not discard/zero the whole sparse image on the hosted runner.  Lazy
+          # inode/journal initialisation makes mkfs finish in seconds while the
+          # resulting filesystem is fully valid after first mount/e2fsck.
+          sudo mkfs.ext4 -F -L Armada -E nodiscard,lazy_itable_init=1,lazy_journal_init=1 "$rootfs"
           sudo mount -o loop "$rootfs" work/rootfs
 
           ctr=""
