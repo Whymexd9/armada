@@ -68,11 +68,11 @@ for candidate in \
 done
 [ -n "$module_src" ] || { echo "TB321FU modules $TB321FU_KERNEL_VERSION not found in device payload" >&2; exit 1; }
 
-mkdir -p "/usr/lib/modules/$TB321FU_KERNEL_VERSION/dtb"
+mkdir -p "/usr/lib/modules/$TB321FU_KERNEL_VERSION/dtb/qcom"
 rsync -aHAX "$module_src"/ "/usr/lib/modules/$TB321FU_KERNEL_VERSION"/
 install -m 0644 "$image" "/usr/lib/modules/$TB321FU_KERNEL_VERSION/vmlinuz"
-install -m 0644 "$dtb" "/usr/lib/modules/$TB321FU_KERNEL_VERSION/dtb/$TB321FU_DTB_NAME"
-ln -sfn "dtb/$TB321FU_DTB_NAME" "/usr/lib/modules/$TB321FU_KERNEL_VERSION/dtb/platform.dtb"
+install -m 0644 "$dtb" "/usr/lib/modules/$TB321FU_KERNEL_VERSION/dtb/qcom/$TB321FU_DTB_NAME"
+ln -sfn "qcom/$TB321FU_DTB_NAME" "/usr/lib/modules/$TB321FU_KERNEL_VERSION/dtb/platform.dtb"
 
 # Import hardware payload only. Do not copy the whole Ubuntu rootfs into Fedora.
 copy_tree_if_present "$payload/usr/lib/firmware" /usr/lib/firmware
