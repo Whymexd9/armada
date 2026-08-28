@@ -44,19 +44,19 @@ jobs:
           set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y \
-            podman buildah rsync e2fsprogs dosfstools mtools p7zip-full zstd xz-utils \
+            buildah rsync e2fsprogs dosfstools mtools p7zip-full zstd xz-utils \
             curl tar dpkg-dev kmod util-linux jq
 
       - name: Build Armada ARM64 userspace
         run: |
           set -euxo pipefail
           version="y700-$(git rev-parse --short HEAD)"
-          sudo podman build \
+          sudo buildah bud \
             --format docker \
             --build-arg "ARMADA_VERSION=${version}" \
             -t localhost/armada-y700:raw \
             .
-          sudo podman image inspect localhost/armada-y700:raw >/dev/null
+          sudo buildah images localhost/armada-y700:raw
 
       - name: Build ext4 Y700 rootfs
         env:
@@ -71,34 +71,35 @@ jobs:
           sudo mkfs.ext4 -F -L Armada -E lazy_itable_init=0,lazy_journal_init=0 "$rootfs"
           sudo mount -o loop "$rootfs" work/rootfs
 
-          cid=$(sudo podman create localhost/armada-y700:raw)
+          ctr=""
           cleanup() {
             set +e
-            sudo podman unmount "$cid" >/dev/null 2>&1 || true
-            sudo podman rm -f "$cid" >/dev/null 2>&1 || true
+            if [ -n "$ctr" ]; then
+              sudo buildah unmount "$ctr" >/dev/null 2>&1 || true
+              sudo buildah rm "$ctr" >/dev/null 2>&1 || true
+            fi
             mountpoint -q work/rootfs && sudo umount work/rootfs || true
           }
           trap cleanup EXIT
-          src=$(sudo podman mount "$cid")
+          ctr=$(sudo buildah from localhost/armada-y700:raw)
+          src=$(sudo buildah mount "$ctr")
           sudo rsync -aHAX --numeric-ids "$src/" work/rootfs/
-          sudo podman unmount "$cid"
-          sudo podman rm "$cid"
-          cid=
+          sudo buildah unmount "$ctr"
+          sudo buildah rm "$ctr"
+          ctr=""
 
           curl -fL --retry 3 -o work/kernel.tar.gz "$KERNEL_ARTIFACT_URL"
           tar -xzf work/kernel.tar.gz -C work/kernel
           echo '=== Y700 kernel artifact inventory ==='
           find work/kernel -maxdepth 5 -type f -printf '%P\n' | sort | head -200
 
-          # Install any module trees shipped with the verified kernel artifact.
+          # Install module trees if the verified kernel input contains them.
           while IFS= read -r moddir; do
-            rel=${moddir#*/lib/modules/}
-            [ "$rel" != "$moddir" ] || continue
-            kver=${rel%%/*}
+            kver=$(basename "$moddir")
             [ -n "$kver" ] || continue
             sudo mkdir -p "work/rootfs/usr/lib/modules/$kver"
             sudo rsync -aHAX "$moddir/" "work/rootfs/usr/lib/modules/$kver/"
-          done < <(find work/kernel -type d -path '*/lib/modules/*' -mindepth 1 -maxdepth 8 | awk -F'/lib/modules/' 'NF==2 && $2 !~ /\// {print}' | sort -u)
+          done < <(find work/kernel -type d -path '*/lib/modules/*' | awk -F'/lib/modules/' 'NF==2 && $2 !~ /\// {print}' | sort -u)
 
           curl -fL --retry 3 -o work/device-debs.tar.gz "$DEVICE_DEBS_URL"
           tar -xzf work/device-debs.tar.gz -C work/debs
@@ -110,7 +111,7 @@ jobs:
             dpkg-deb -x "$deb" work/deb-root
           done
 
-          # Only transplant distro-neutral device payloads. Do not copy Ubuntu userspace libraries/binaries.
+          # Transplant distro-neutral device payloads only; Ubuntu-linked userspace binaries stay out.
           copy_tree() {
             src=$1 dst=$2
             [ -e "work/deb-root/$src" ] || return 0
@@ -128,34 +129,32 @@ jobs:
           copy_tree usr/share/alsa/ucm2 usr/share/alsa/ucm2
           copy_tree usr/share/wireplumber usr/share/wireplumber
 
-          # Fedora/bootc images use /usr/lib/modules. Remove unrelated Armada kernel modules
-          # so depmod and runtime module lookup cannot accidentally target the wrong kernel.
           kver=7.1.1-g5df8e852ea72
-          if [ -d "work/rootfs/usr/lib/modules/$kver" ]; then
-            find work/rootfs/usr/lib/modules -mindepth 1 -maxdepth 1 -type d ! -name "$kver" -print0 | sudo xargs -0r rm -rf
-            sudo depmod -b work/rootfs "$kver"
-          fi
+          test -d "work/rootfs/usr/lib/modules/$kver"
+          find work/rootfs/usr/lib/modules -mindepth 1 -maxdepth 1 -type d ! -name "$kver" -print0 | sudo xargs -0r rm -rf
+          sudo depmod -b work/rootfs "$kver"
 
           echo armada-y700 | sudo tee work/rootfs/etc/hostname >/dev/null
           sudo truncate -s 0 work/rootfs/etc/machine-id
           sudo rm -f work/rootfs/var/lib/dbus/machine-id || true
-          sudo mkdir -p work/rootfs/etc
           printf 'LABEL=Armada / ext4 defaults,noatime 0 1\n' | sudo tee work/rootfs/etc/fstab >/dev/null
 
-          # Avoid bootc trying to manage an Android-style boot layout on first boot.
+          # bootc update writes are intentionally disabled for this Android/GRUB partition layout.
           sudo systemctl --root=work/rootfs disable bootc-fetch-apply-updates.timer 2>/dev/null || true
 
           echo '=== Rootfs validation ==='
           test -x work/rootfs/usr/lib/systemd/systemd
           test -x work/rootfs/usr/bin/steam || test -x work/rootfs/usr/bin/steam-wrapper || test -e work/rootfs/usr/share/applications/steam.desktop
           test -d work/rootfs/var/home/armada
-          test -f work/rootfs/etc/passwd
           grep -q '^armada:' work/rootfs/etc/passwd
           test -d "work/rootfs/usr/lib/modules/$kver"
-          find "work/rootfs/usr/lib/modules/$kver" -type f | head
-          sudo e2fsck -fy "$rootfs" || rc=$?; test "${rc:-0}" -le 1
-          sudo tune2fs -l "$rootfs" | grep -E 'Filesystem volume name|Filesystem state|Filesystem features'
+          test "$(find "work/rootfs/usr/lib/modules/$kver" -type f | wc -l)" -gt 0
+          find "work/rootfs/usr/lib/modules/$kver" -type f | head -50
+
           sudo umount work/rootfs
+          sudo e2fsck -fy "$rootfs" || rc=$?
+          test "${rc:-0}" -le 1
+          sudo tune2fs -l "$rootfs" | grep -E 'Filesystem volume name|Filesystem state|Filesystem features'
           trap - EXIT
 
           7z a -t7z -m0=lzma2 -mx=9 -mmt=on out/rootfs.img.7z "$rootfs" >/dev/null
