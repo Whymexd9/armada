@@ -1,0 +1,213 @@
+name: Build Armada for Lenovo Y700
+
+on:
+  push:
+    branches: [armada-y700]
+    paths:
+      - 'Containerfile'
+      - 'build_files/**'
+      - 'system_files/**'
+      - 'decky/**'
+      - '.github/workflows/build-y700.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: armada-y700-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Y700 flash images
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 300
+    steps:
+      - name: Maximize build space
+        uses: ublue-os/remove-unwanted-software@cc0becac701cf642c8f0a6613bbdaf5dc36b259e
+        with:
+          remove-codeql: true
+
+      - name: Checkout Armada
+        uses: actions/checkout@v4
+
+      - name: Checkout verified Y700 boot pipeline
+        uses: actions/checkout@v4
+        with:
+          repository: Whymexd9/ubuntu-y700-build-ci
+          ref: main
+          path: y700-ref
+
+      - name: Install host tools
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            podman buildah rsync e2fsprogs dosfstools mtools p7zip-full zstd xz-utils \
+            curl tar dpkg-dev kmod util-linux jq
+
+      - name: Build Armada ARM64 userspace
+        run: |
+          set -euxo pipefail
+          version="y700-$(git rev-parse --short HEAD)"
+          sudo podman build \
+            --format docker \
+            --build-arg "ARMADA_VERSION=${version}" \
+            -t localhost/armada-y700:raw \
+            .
+          sudo podman image inspect localhost/armada-y700:raw >/dev/null
+
+      - name: Build ext4 Y700 rootfs
+        env:
+          KERNEL_ARTIFACT_URL: https://github.com/GUF296/ubuntu-y700-build-ci/releases/download/bootstrap-y700-20260625/y700-kernel-artifacts-7.1.1-g5df8e852ea72.tar.gz
+          DEVICE_DEBS_URL: https://github.com/GUF296/ubuntu-y700-build-ci/releases/download/bootstrap-y700-20260625/y700-device-debs-20260624-201420-compat1.tar.gz
+          ROOTFS_SIZE: 20G
+        run: |
+          set -euxo pipefail
+          mkdir -p out work/rootfs work/kernel work/debs work/deb-root
+          rootfs=out/armada-y700-rootfs.img
+          truncate -s "$ROOTFS_SIZE" "$rootfs"
+          sudo mkfs.ext4 -F -L Armada -E lazy_itable_init=0,lazy_journal_init=0 "$rootfs"
+          sudo mount -o loop "$rootfs" work/rootfs
+
+          cid=$(sudo podman create localhost/armada-y700:raw)
+          cleanup() {
+            set +e
+            sudo podman unmount "$cid" >/dev/null 2>&1 || true
+            sudo podman rm -f "$cid" >/dev/null 2>&1 || true
+            mountpoint -q work/rootfs && sudo umount work/rootfs || true
+          }
+          trap cleanup EXIT
+          src=$(sudo podman mount "$cid")
+          sudo rsync -aHAX --numeric-ids "$src/" work/rootfs/
+          sudo podman unmount "$cid"
+          sudo podman rm "$cid"
+          cid=
+
+          curl -fL --retry 3 -o work/kernel.tar.gz "$KERNEL_ARTIFACT_URL"
+          tar -xzf work/kernel.tar.gz -C work/kernel
+          echo '=== Y700 kernel artifact inventory ==='
+          find work/kernel -maxdepth 5 -type f -printf '%P\n' | sort | head -200
+
+          # Install any module trees shipped with the verified kernel artifact.
+          while IFS= read -r moddir; do
+            rel=${moddir#*/lib/modules/}
+            [ "$rel" != "$moddir" ] || continue
+            kver=${rel%%/*}
+            [ -n "$kver" ] || continue
+            sudo mkdir -p "work/rootfs/usr/lib/modules/$kver"
+            sudo rsync -aHAX "$moddir/" "work/rootfs/usr/lib/modules/$kver/"
+          done < <(find work/kernel -type d -path '*/lib/modules/*' -mindepth 1 -maxdepth 8 | awk -F'/lib/modules/' 'NF==2 && $2 !~ /\// {print}' | sort -u)
+
+          curl -fL --retry 3 -o work/device-debs.tar.gz "$DEVICE_DEBS_URL"
+          tar -xzf work/device-debs.tar.gz -C work/debs
+          mapfile -t debs < <(find work/debs -type f -name '*.deb' | sort)
+          test "${#debs[@]}" -gt 0
+          echo "Found ${#debs[@]} Y700 device packages"
+          for deb in "${debs[@]}"; do
+            echo "Extracting $(basename "$deb")"
+            dpkg-deb -x "$deb" work/deb-root
+          done
+
+          # Only transplant distro-neutral device payloads. Do not copy Ubuntu userspace libraries/binaries.
+          copy_tree() {
+            src=$1 dst=$2
+            [ -e "work/deb-root/$src" ] || return 0
+            sudo mkdir -p "work/rootfs/$dst"
+            sudo rsync -aHAX "work/deb-root/$src/" "work/rootfs/$dst/"
+          }
+          copy_tree lib/modules usr/lib/modules
+          copy_tree usr/lib/modules usr/lib/modules
+          copy_tree lib/firmware usr/lib/firmware
+          copy_tree usr/lib/firmware usr/lib/firmware
+          copy_tree etc/modprobe.d etc/modprobe.d
+          copy_tree usr/lib/modprobe.d usr/lib/modprobe.d
+          copy_tree etc/udev/rules.d etc/udev/rules.d
+          copy_tree usr/lib/udev/rules.d usr/lib/udev/rules.d
+          copy_tree usr/share/alsa/ucm2 usr/share/alsa/ucm2
+          copy_tree usr/share/wireplumber usr/share/wireplumber
+
+          # Fedora/bootc images use /usr/lib/modules. Remove unrelated Armada kernel modules
+          # so depmod and runtime module lookup cannot accidentally target the wrong kernel.
+          kver=7.1.1-g5df8e852ea72
+          if [ -d "work/rootfs/usr/lib/modules/$kver" ]; then
+            find work/rootfs/usr/lib/modules -mindepth 1 -maxdepth 1 -type d ! -name "$kver" -print0 | sudo xargs -0r rm -rf
+            sudo depmod -b work/rootfs "$kver"
+          fi
+
+          echo armada-y700 | sudo tee work/rootfs/etc/hostname >/dev/null
+          sudo truncate -s 0 work/rootfs/etc/machine-id
+          sudo rm -f work/rootfs/var/lib/dbus/machine-id || true
+          sudo mkdir -p work/rootfs/etc
+          printf 'LABEL=Armada / ext4 defaults,noatime 0 1\n' | sudo tee work/rootfs/etc/fstab >/dev/null
+
+          # Avoid bootc trying to manage an Android-style boot layout on first boot.
+          sudo systemctl --root=work/rootfs disable bootc-fetch-apply-updates.timer 2>/dev/null || true
+
+          echo '=== Rootfs validation ==='
+          test -x work/rootfs/usr/lib/systemd/systemd
+          test -x work/rootfs/usr/bin/steam || test -x work/rootfs/usr/bin/steam-wrapper || test -e work/rootfs/usr/share/applications/steam.desktop
+          test -d work/rootfs/var/home/armada
+          test -f work/rootfs/etc/passwd
+          grep -q '^armada:' work/rootfs/etc/passwd
+          test -d "work/rootfs/usr/lib/modules/$kver"
+          find "work/rootfs/usr/lib/modules/$kver" -type f | head
+          sudo e2fsck -fy "$rootfs" || rc=$?; test "${rc:-0}" -le 1
+          sudo tune2fs -l "$rootfs" | grep -E 'Filesystem volume name|Filesystem state|Filesystem features'
+          sudo umount work/rootfs
+          trap - EXIT
+
+          7z a -t7z -m0=lzma2 -mx=9 -mmt=on out/rootfs.img.7z "$rootfs" >/dev/null
+          rm -f "$rootfs"
+
+      - name: Build verified Y700 GRUB image
+        env:
+          OUTPUT_DIR: out/grub
+          OUTPUT_PREFIX: armada-y700
+          BOOT_TEMPLATE_IMAGE: https://github.com/GUF296/ubuntu-y700-build-ci/releases/download/bootstrap-y700-20260625/y700-verified-grub-template-userdata-20260624-201420.img
+          KERNEL_ARTIFACT_ARCHIVE: https://github.com/GUF296/ubuntu-y700-build-ci/releases/download/bootstrap-y700-20260625/y700-kernel-artifacts-7.1.1-g5df8e852ea72.tar.gz
+          DTB_NAME: sm8650-lenovo-tb321fu.dtb
+          ROOT_SELECTOR: partlabel
+          ROOT_PARTLABEL: userdata
+          STABLEARGS: drm_client_lib.active=none
+          BOOT_COMPRESS: 7z
+          KEEP_BOOT_IMAGE: '0'
+        run: |
+          set -euxo pipefail
+          mkdir -p out/grub
+          bash y700-ref/scripts/ci/build-grub-image.sh
+          cp y700-ref/source/boot-image/boot.img.7z out/boot.img.7z
+
+      - name: Validate images and write checksums
+        run: |
+          set -euxo pipefail
+          test -s out/rootfs.img.7z
+          test -s out/grub/armada-y700-grub-fat.img.7z
+          test -s out/boot.img.7z
+          mkdir -p out/release
+          cp out/rootfs.img.7z out/release/rootfs.img.7z
+          cp out/grub/armada-y700-grub-fat.img.7z out/release/grub.img.7z
+          cp out/boot.img.7z out/release/boot.img.7z
+          (cd out/release && sha256sum boot.img.7z grub.img.7z rootfs.img.7z > SHA256SUMS.txt)
+          cat > out/release/README.txt <<'EOF'
+          Armada OS for Lenovo Legion Y700 / TB321FU (SM8650)
+
+          Images:
+            boot.img.7z   - Android boot partition image from the verified Y700 reference pipeline
+            grub.img.7z   - FAT/GRUB image using sm8650-lenovo-tb321fu.dtb and kernel 7.1.1-g5df8e852ea72
+            rootfs.img.7z - Armada Fedora/Steam/FEX/Proton userspace, ext4 label Armada
+
+          GRUB resolves the Linux root filesystem by GPT PARTLABEL=userdata.
+          The default Armada user/password are: armada / armada
+          Verify all files against SHA256SUMS.txt before flashing.
+          EOF
+          sed -i 's/^          //' out/release/README.txt
+
+      - name: Upload complete flash bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: armada-y700-flash-bundle
+          path: out/release/*
+          if-no-files-found: error
+          compression-level: 0
